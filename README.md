@@ -10,11 +10,11 @@ Building PostgreSQL from source across multiple branches is tedious. You need to
 
 `pgdev` handles all of this:
 
-- **One command to build** — `pgdev new REL_17_STABLE` creates a worktree, configures with debug/assert flags, and builds with ccache
 - **Per-worktree isolation** — each worktree gets its own `install/`, `data/`, and `.envrc` with correct PATH and PG environment variables
 - **direnv integration** — `cd` into a worktree and your shell automatically picks up the right `pg_ctl`, `psql`, `PGDATA`, and `PGPORT`
 - **Cluster lifecycle** — `pgdev initdb`, `pgdev start`, `pgdev stop` manage the cluster in the current worktree
 - **Multi-version dashboard** — `pgdev ls` shows all worktrees with their version and running status
+- **Clean removal** — `pgdev rm` stops the cluster and removes the worktree properly (no stale git references)
 
 ## Quick Start
 
@@ -23,16 +23,15 @@ Building PostgreSQL from source across multiple branches is tedious. You need to
 pgdev setup
 
 # Clone the PostgreSQL repo (one-time)
-git clone https://github.com/postgres/postgres.git ~/public_repos/postgres
-cd ~/public_repos/postgres
+git clone https://github.com/postgres/postgres.git ~/src/postgres
+cd ~/src/postgres
 
-# Create a worktree for a release branch, build it
-pgdev new REL_17_STABLE
+# Create a worktree for a release branch
+pgdev new REL_17_STABLE 17
 
-# Move into it
-cd ../pg-REL_17_STABLE
-
-# Initialize a cluster and start it
+# Move into it, build, init, start
+cd ../pg-17
+pgdev build
 pgdev initdb
 pgdev start
 
@@ -44,7 +43,7 @@ psql -c "SELECT version();"
 
 | Command | Description |
 |---------|-------------|
-| `pgdev new <branch> [name]` | Create a worktree for `<branch>`, configure, and build. Optional `name` overrides the directory name (`pg-<name>`) |
+| `pgdev new <branch> [name]` | Create a worktree for `<branch>` and write `.envrc`. Optional `name` overrides the directory name (`pg-<name>`) |
 | `pgdev build` | Configure + build + install the current worktree |
 | `pgdev configure` | Run `./configure` with dev flags (no build) |
 | `pgdev initdb [--port PORT]` | Initialize `data/` for the current worktree. Optional `--port` sets a custom port in both `postgresql.conf` and `.envrc` |
@@ -54,6 +53,7 @@ psql -c "SELECT version();"
 | `pgdev restart` | Restart the cluster |
 | `pgdev status` | Show postgres version and `pg_ctl` status |
 | `pgdev test [target] [args]` | Run regression tests. Targets: `check` (default), `world`, `installcheck` |
+| `pgdev rm <name>` | Stop the cluster and remove the worktree cleanly (e.g. `pgdev rm 17`) |
 | `pgdev ls` | List all `pg-*` worktrees with version and running/stopped status |
 | `pgdev setup` | Check that all dependencies are installed |
 
@@ -64,14 +64,14 @@ psql -c "SELECT version();"
 `pgdev new` creates worktrees as siblings of the main PostgreSQL repo:
 
 ```
-~/public_repos/
+~/src/
 ├── postgres/              # main repo (git clone)
-├── pg-REL_17_STABLE/      # pgdev new REL_17_STABLE
-│   ├── install/           #   ./configure --prefix=$PWD/install → make install
+├── pg-17/                 # pgdev new REL_17_STABLE 17
+│   ├── install/           #   pgdev build → ./configure + make install
 │   ├── data/              #   pgdev initdb
 │   ├── .envrc             #   direnv: PATH, PGDATA, PGPORT, PGHOST
 │   └── (postgres source)
-├── pg-REL_16_STABLE/      # pgdev new REL_16_STABLE
+├── pg-16/                 # pgdev new REL_16_STABLE 16
 └── pg-my-patch/           # pgdev new my-feature-branch my-patch
 ```
 
@@ -88,9 +88,9 @@ Every build uses developer-friendly defaults:
 | `--with-readline` | readline support for `psql` |
 | `--with-icu` | ICU collation support |
 | `CFLAGS="-ggdb -Og -g3 -fno-omit-frame-pointer"` | Full debug info, minimal optimization |
-| `CC="ccache cc"` | ccache for fast rebuilds |
+| `CC="ccache cc"` | ccache for fast rebuilds (falls back to `cc` if ccache is not installed) |
 
-If [bear](https://github.com/rizsotto/Bear) is installed, `pgdev build` automatically wraps the build to generate `compile_commands.json` for IDE integration.
+If [bear](https://github.com/rizsotto/Bear) is installed, `pgdev build` automatically wraps the build to generate `compile_commands.json` for IDE integration (clangd, VS Code, Cursor).
 
 ### Per-Worktree Overrides
 
@@ -117,11 +117,39 @@ PATH_add "$PGDIR/bin"
 
 When you `cd` into a worktree, direnv loads these automatically — `psql`, `pg_ctl`, and all PG tools resolve to the correct version.
 
+### First-Run Setup
+
+On first use, if `PGDEV_REPOS_DIR` is not set and you're not inside a git repo, pgdev will interactively ask for your repos directory and tell you exactly what to add to your shell rc file:
+
+```
+  pgdev needs to know where your PostgreSQL repo and worktrees live.
+  This is the parent directory that contains (or will contain) the
+  postgres/ clone and pg-* worktrees.
+
+  Example: if your repo is at ~/src/postgres, enter ~/src
+
+  Repos directory: ~/src
+
+  Add this to /home/user/.bashrc so pgdev remembers next time:
+
+    export PGDEV_REPOS_DIR="/home/user/src"
+```
+
+### Dependency Checks
+
+Every command validates its dependencies before running. If something is missing, you get a clear message pointing you to `pgdev setup`:
+
+```
+pgdev: error: 'make' is not installed — run 'pgdev setup' to check all dependencies
+```
+
+`pgdev setup` checks everything at once and tells you exactly what to install and how.
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PGDEV_REPOS_DIR` | Parent of current git repo | Directory where `pg-*` worktrees are created |
+| `PGDEV_REPOS_DIR` | Auto-detected from current git repo | Parent directory where `pg-*` worktrees are created |
 
 ## Platform Support
 
@@ -129,7 +157,10 @@ When you `cd` into a worktree, direnv loads these automatically — `psql`, `pg_
 |----------|--------|
 | macOS (Apple Silicon) | Fully supported — auto-detects Homebrew at `/opt/homebrew` |
 | macOS (Intel) | Fully supported — uses `/usr/local` |
-| Linux (Debian/Ubuntu) | Supported |
+| Linux (Debian/Ubuntu) | Fully supported — `apt` packages |
+| Linux (Fedora/RHEL) | Fully supported — `dnf`/`yum` packages |
+| Linux (Arch) | Fully supported — `pacman` packages |
+| Linux (Alpine) | Fully supported — `apk` packages |
 
 ## License
 
