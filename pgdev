@@ -1,0 +1,594 @@
+#!/usr/bin/env bash
+# pgdev - PostgreSQL multi-version development environment helper
+# Usage: pgdev <command> [args]
+set -euo pipefail
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+PGDEV_REPOS_DIR="${PGDEV_REPOS_DIR:-}"
+
+PG_CONFIGURE_DEFAULTS=(
+    --enable-cassert
+    --enable-debug
+    --enable-depend
+    --with-openssl
+    --with-readline
+    --with-icu
+)
+
+PG_CFLAGS="-ggdb -Og -g3 -fno-omit-frame-pointer"
+if command -v ccache &>/dev/null; then
+    PG_CC="ccache cc"
+else
+    PG_CC="cc"
+fi
+
+# Homebrew paths for Apple Silicon (fallback to Intel if needed)
+case "$(uname -s)" in
+    Darwin)
+        if [[ -d /opt/homebrew ]]; then
+            HB="/opt/homebrew"
+        else
+            HB="/usr/local"
+        fi
+        PG_LDFLAGS="-L${HB}/opt/openssl/lib -L${HB}/opt/readline/lib -L${HB}/opt/icu4c/lib"
+        PG_CPPFLAGS="-I${HB}/opt/openssl/include -I${HB}/opt/readline/include -I${HB}/opt/icu4c/include"
+        ;;
+    Linux)
+        PG_LDFLAGS=""
+        PG_CPPFLAGS=""
+        ;;
+esac
+
+ENVRC_TEMPLATE='export PGDIR="$PWD/install"
+export PGDATA="$PWD/data"
+export PGHOST="/tmp"
+export PGPORT="5432"
+export PGUSER="'"$USER"'"
+export PGDATABASE="postgres"
+PATH_add "$PGDIR/bin"
+'
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { echo "pgdev: error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+_require() {
+    command -v "$1" &>/dev/null || die "'$1' is not installed — run 'pgdev setup' to check all dependencies"
+}
+
+# Check if a Linux dev library is installed across package managers.
+# Args: display_name deb_pkg rpm_pkg pacman_pkg apk_pkg
+_check_linux_lib() {
+    local name="$1" deb="$2" rpm="$3" pac="$4" apk="$5"
+    if command -v dpkg &>/dev/null && dpkg -s "$deb" &>/dev/null; then
+        echo "  ✓ ${name} (${deb})"
+    elif command -v rpm &>/dev/null && rpm -q "$rpm" &>/dev/null; then
+        echo "  ✓ ${name} (${rpm})"
+    elif command -v pacman &>/dev/null && pacman -Qi "$pac" &>/dev/null; then
+        echo "  ✓ ${name} (${pac})"
+    elif command -v apk &>/dev/null && apk info -e "$apk" &>/dev/null; then
+        echo "  ✓ ${name} (${apk})"
+    else
+        local hint=""
+        if command -v apt &>/dev/null; then hint="apt install ${deb}"
+        elif command -v dnf &>/dev/null; then hint="dnf install ${rpm}"
+        elif command -v yum &>/dev/null; then hint="yum install ${rpm}"
+        elif command -v pacman &>/dev/null; then hint="pacman -S ${pac}"
+        elif command -v apk &>/dev/null; then hint="apk add ${apk}"
+        else hint="install ${name}-dev with your package manager"
+        fi
+        echo "  ✗ ${name} — run: ${hint}"
+        return 1
+    fi
+}
+
+# Get the root of the current git worktree
+worktree_root() {
+    _require git
+    git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"
+}
+
+# Detect CPU count
+cpu_count() {
+    nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4
+}
+
+_detect_shell_rc() {
+    case "${SHELL:-}" in
+        */zsh)  echo "$HOME/.zshrc" ;;
+        */bash) echo "$HOME/.bashrc" ;;
+        */fish) echo "$HOME/.config/fish/config.fish" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Resolve PGDEV_REPOS_DIR: env var → git context → interactive prompt.
+# Sets the global PGDEV_REPOS_DIR variable.
+_ensure_repos_dir() {
+    [[ -n "$PGDEV_REPOS_DIR" ]] && return
+
+    # Try to derive from current git repo
+    local git_root
+    if git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+        PGDEV_REPOS_DIR=$(dirname "$git_root")
+        return
+    fi
+
+    # Not set and not in a git repo — interactive first-run prompt
+    [[ -t 0 ]] || die "PGDEV_REPOS_DIR is not set (non-interactive shell — set it in your rc file)"
+
+    echo ""
+    echo "  pgdev needs to know where your PostgreSQL repo and worktrees live."
+    echo "  This is the parent directory that contains (or will contain) the"
+    echo "  postgres/ clone and pg-* worktrees."
+    echo ""
+    echo "  Example: if your repo is at ~/src/postgres, enter ~/src"
+    echo ""
+    read -rp "  Repos directory: " user_dir
+    echo ""
+
+    # Expand ~
+    user_dir="${user_dir/#\~/$HOME}"
+
+    [[ -n "$user_dir" ]] || die "no directory entered"
+    [[ -d "$user_dir" ]] || die "directory does not exist: $user_dir"
+
+    # Canonicalize to absolute path
+    PGDEV_REPOS_DIR="$(cd "$user_dir" && pwd)"
+
+    local rc
+    rc=$(_detect_shell_rc)
+    local export_line="export PGDEV_REPOS_DIR=\"${PGDEV_REPOS_DIR}\""
+
+    if [[ -n "$rc" ]]; then
+        local shell_name
+        shell_name=$(basename "${SHELL:-sh}")
+        if [[ "$shell_name" == "fish" ]]; then
+            export_line="set -Ux PGDEV_REPOS_DIR \"${PGDEV_REPOS_DIR}\""
+        fi
+        echo "  Add this to ${rc} so pgdev remembers next time:"
+        echo ""
+        echo "    ${export_line}"
+        echo ""
+    else
+        echo "  Add this to your shell rc file so pgdev remembers next time:"
+        echo ""
+        echo "    ${export_line}"
+        echo ""
+    fi
+}
+
+# Resolve the repos parent directory from the current worktree or PGDEV_REPOS_DIR
+repos_parent() {
+    _ensure_repos_dir
+    echo "$PGDEV_REPOS_DIR"
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<'EOF'
+pgdev - PostgreSQL multi-version development environment helper
+
+Commands:
+  pgdev new <branch> [name]   Create worktree for <branch>, configure, build
+  pgdev build                 Configure + build + install current worktree
+  pgdev configure             Run ./configure with dev flags (no build)
+  pgdev initdb [--port PORT]   Initialize PGDATA (data/) for current worktree
+  pgdev deletedb              Stop cluster (if running) and delete data/
+  pgdev start                 Start postgres cluster
+  pgdev stop                  Stop postgres cluster
+  pgdev restart               Restart postgres cluster
+  pgdev status                Show pg_ctl status and postgres version
+  pgdev test [world|check|installcheck] [extra make args...]
+                              Run regression tests
+  pgdev rm <name>             Stop cluster and remove worktree (e.g. pgdev rm 17)
+  pgdev ls                    List all pg-* worktrees with version + status
+  pgdev setup                 Check dependencies and print setup status
+  pgdev help                  Show this help
+
+Environment:
+  PGDEV_REPOS_DIR   Parent directory where worktrees are created
+                    (default: auto-detected from current git repo)
+
+Per-worktree override:
+  Create pgdev.conf in the repo root to override configure flags:
+    EXTRA_CONFIGURE_FLAGS=(--with-python --with-perl)
+EOF
+}
+
+cmd_setup() {
+    info "Checking dependencies..."
+    local ok=1
+    for cmd in ccache direnv git make; do
+        if command -v "$cmd" &>/dev/null; then
+            echo "  ✓ $cmd ($(command -v "$cmd"))"
+        else
+            echo "  ✗ $cmd — MISSING"
+            ok=0
+        fi
+    done
+
+    # Check Homebrew packages
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        for pkg in openssl readline icu4c; do
+            if [[ -d "${HB}/opt/${pkg}" ]]; then
+                echo "  ✓ ${pkg}"
+            else
+                echo "  ✗ ${pkg} — run: brew install ${pkg}"
+                ok=0
+            fi
+        done
+    else
+        _check_linux_lib openssl  libssl-dev  openssl-devel  openssl  openssl-dev  || ok=0
+        _check_linux_lib readline libreadline-dev readline-devel readline readline-dev || ok=0
+        _check_linux_lib icu      libicu-dev     libicu-devel   icu      icu-dev     || ok=0
+    fi
+
+    # Check ccache config
+    local ccconf="$HOME/.config/ccache/ccache.conf"
+    if [[ -f "$ccconf" ]] && grep -q "hash_dir = false" "$ccconf"; then
+        echo "  ✓ ccache hash_dir=false"
+    else
+        echo "  ✗ ccache: missing hash_dir=false in $ccconf"
+        echo "    Fix: mkdir -p ~/.config/ccache && echo 'hash_dir = false' >> $ccconf"
+        ok=0
+    fi
+
+    # Check direnv hook
+    local shell_rc_found=0
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+        if grep -q "direnv hook" "$rc" 2>/dev/null; then
+            shell_rc_found=1
+            break
+        fi
+    done
+    if [[ "${DIRENV_DIR:-}" != "" ]] || [[ $shell_rc_found -eq 1 ]]; then
+        echo "  ✓ direnv hook in shell rc"
+    else
+        echo "  ✗ direnv hook missing from shell rc — add: eval \"\$(direnv hook bash)\" (or zsh)"
+        ok=0
+    fi
+
+    if [[ $ok -eq 1 ]]; then
+        info "All good! Run 'pgdev build' to build the current worktree."
+    else
+        info "Fix the issues above, then run 'pgdev setup' again."
+    fi
+}
+
+cmd_new() {
+    _require direnv
+
+    local branch="${1:-}" name="${2:-}"
+    [[ -n "$branch" ]] || die "usage: pgdev new <branch> [name]"
+    [[ -z "$name" ]] && name="$branch"
+
+    # git worktree add requires being inside a git repo
+    worktree_root >/dev/null
+
+    local parent
+    parent=$(repos_parent)
+    local dest="${parent}/pg-${name}"
+
+    [[ -d "$dest" ]] && die "directory already exists: $dest"
+
+    info "Creating worktree for '$branch' at $dest"
+    git worktree add "$dest" "$branch"
+
+    info "Writing .envrc"
+    printf '%s' "$ENVRC_TEMPLATE" > "$dest/.envrc"
+    direnv allow "$dest"
+
+    info "Done! To get started:"
+    echo ""
+    echo "  cd $dest"
+    echo "  pgdev build"
+    echo "  pgdev initdb"
+    echo "  pgdev start"
+}
+
+cmd_build() {
+    local root
+    root=$(worktree_root)
+    cd "$root"
+    _do_configure
+    _do_make
+}
+
+cmd_configure() {
+    local root
+    root=$(worktree_root)
+    cd "$root"
+    _do_configure
+}
+
+_load_pgdev_conf() {
+    # Source optional pgdev.conf from worktree root for per-worktree overrides
+    local conf="${1}/pgdev.conf"
+    EXTRA_CONFIGURE_FLAGS=()
+    if [[ -f "$conf" ]]; then
+        # shellcheck source=/dev/null
+        source "$conf"
+    fi
+}
+
+_do_configure() {
+    # Must be called from the worktree root
+    [[ -x "./configure" ]] || die "./configure not found — are you inside a PostgreSQL source tree?"
+    _load_pgdev_conf "$PWD"
+
+    local prefix="$PWD/install"
+    info "Configuring with prefix=$prefix"
+
+    ./configure \
+        --prefix="$prefix" \
+        "${PG_CONFIGURE_DEFAULTS[@]}" \
+        "${EXTRA_CONFIGURE_FLAGS[@]+"${EXTRA_CONFIGURE_FLAGS[@]}"}" \
+        "CFLAGS=${PG_CFLAGS}" \
+        "CC=${PG_CC}" \
+        "LDFLAGS=${PG_LDFLAGS}" \
+        "CPPFLAGS=${PG_CPPFLAGS}"
+}
+
+_do_make() {
+    _require make
+    local j
+    j=$(cpu_count)
+    info "Building with make -j${j}"
+    if command -v bear &>/dev/null; then
+        info "Wrapping build with bear (compile_commands.json)"
+        bear -- make -j"$j"
+    else
+        make -j"$j"
+    fi
+    info "Installing to ./install/"
+    make install
+    info "Installing contrib..."
+    make -C contrib install
+}
+
+cmd_deletedb() {
+    local root
+    root=$(worktree_root)
+    local datadir="${root}/data"
+    local pg_ctl="${root}/install/bin/pg_ctl"
+
+    [[ -d "$datadir" ]] || die "data/ not found at $datadir"
+
+    # Stop if running
+    if [[ -x "$pg_ctl" ]] && "$pg_ctl" -D "$datadir" status &>/dev/null 2>&1; then
+        info "Stopping running cluster..."
+        "$pg_ctl" -D "$datadir" stop
+    fi
+
+    info "Removing $datadir"
+    rm -rf "$datadir"
+    info "Done. Run 'pgdev initdb' to recreate."
+}
+
+cmd_initdb() {
+    local port=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)
+                [[ -n "${2:-}" ]] || die "--port requires a value"
+                port="$2"
+                shift 2
+                ;;
+            --port=*)
+                port="${1#--port=}"
+                shift
+                ;;
+            *) die "unknown option '$1'" ;;
+        esac
+    done
+
+    local root
+    root=$(worktree_root)
+    local datadir="${root}/data"
+    local bindir="${root}/install/bin"
+
+    [[ -d "$bindir" ]] || die "install/bin not found — run 'pgdev build' first"
+    [[ -d "$datadir" ]] && die "data/ already exists at $datadir"
+
+    info "Initializing cluster at $datadir"
+    "${bindir}/initdb" -D "$datadir" --auth=trust
+
+    # Allow connections via Unix socket from any local user (dev-friendly)
+    cat >> "$datadir/postgresql.conf" <<'CONF'
+
+# pgdev: developer settings
+listen_addresses = 'localhost'
+log_destination = 'stderr'
+logging_collector = off
+log_min_messages = warning
+CONF
+
+    if [[ -n "$port" ]]; then
+        echo "port = ${port}" >> "$datadir/postgresql.conf"
+        # Patch PGPORT in .envrc if it exists
+        local envrc="${root}/.envrc"
+        if [[ -f "$envrc" ]]; then
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+                sed -i '' "s/^export PGPORT=.*/export PGPORT=\"${port}\"/" "$envrc"
+            else
+                sed -i "s/^export PGPORT=.*/export PGPORT=\"${port}\"/" "$envrc"
+            fi
+            if command -v direnv &>/dev/null; then
+                direnv allow "$envrc"
+            fi
+            info "Updated PGPORT to ${port} in .envrc"
+        fi
+        info "Port set to ${port}"
+    fi
+
+    info "Done. Run 'pgdev start' to start the cluster."
+}
+
+cmd_start() {
+    local root data log
+    root=$(worktree_root)
+    data="${root}/data"
+    log="${data}/pg.log"
+    [[ -d "$data" ]] || die "data/ not found — run 'pgdev initdb' first"
+    info "Starting postgres (log: $log)"
+    "${root}/install/bin/pg_ctl" -D "$data" -l "$log" start
+}
+
+cmd_stop() {
+    local root data
+    root=$(worktree_root)
+    data="${root}/data"
+    [[ -d "$data" ]] || die "data/ not found"
+    "${root}/install/bin/pg_ctl" -D "$data" stop
+}
+
+cmd_restart() {
+    cmd_stop || true
+    cmd_start
+}
+
+cmd_status() {
+    local root data
+    root=$(worktree_root)
+    data="${root}/data"
+
+    local pg_ctl="${root}/install/bin/pg_ctl"
+    local postgres="${root}/install/bin/postgres"
+
+    if [[ -x "$postgres" ]]; then
+        echo "Version: $("$postgres" --version)"
+    else
+        echo "Version: (not built — run pgdev build)"
+    fi
+
+    if [[ -d "$data" ]] && [[ -x "$pg_ctl" ]]; then
+        "$pg_ctl" -D "$data" status || true
+    else
+        echo "Cluster: not initialized (run pgdev initdb)"
+    fi
+}
+
+cmd_test() {
+    _require make
+    local root
+    root=$(worktree_root)
+    cd "$root"
+
+    local target="check"
+    local make_args=()
+
+    for arg in "$@"; do
+        case "$arg" in
+            world)       target="check-world" ;;
+            installcheck) target="installcheck" ;;
+            check)       target="check" ;;
+            *)           make_args+=("$arg") ;;
+        esac
+    done
+
+    local j
+    j=$(cpu_count)
+    info "Running: make -j${j} $target ${make_args[*]+"${make_args[*]}"}"
+    make -j"$j" "$target" "${make_args[@]+"${make_args[@]}"}"
+}
+
+cmd_rm() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: pgdev rm <worktree-name>"
+
+    _ensure_repos_dir
+    local target="${PGDEV_REPOS_DIR}/pg-${name}"
+
+    [[ -d "$target" ]] || die "worktree not found: $target"
+
+    # Stop cluster if running
+    local pg_ctl="${target}/install/bin/pg_ctl"
+    if [[ -d "${target}/data" ]] && [[ -x "$pg_ctl" ]]; then
+        if "$pg_ctl" -D "${target}/data" status &>/dev/null 2>&1; then
+            info "Stopping running cluster..."
+            "$pg_ctl" -D "${target}/data" stop
+        fi
+    fi
+
+    info "Removing worktree at $target"
+    git worktree remove --force "$target"
+    info "Done."
+}
+
+cmd_ls() {
+    _ensure_repos_dir
+    local parent="$PGDEV_REPOS_DIR"
+
+    printf "%-30s  %-20s  %s\n" "WORKTREE" "VERSION" "STATUS"
+    printf "%-30s  %-20s  %s\n" "--------" "-------" "------"
+
+    # Also include the main repo if it contains install/bin/postgres
+    local main_root
+    if main_root=$(git -C "$parent" rev-parse --show-toplevel 2>/dev/null); then
+        _print_worktree_row "$main_root" "(main)"
+    fi
+
+    # Check all pg-* siblings
+    for dir in "${parent}"/pg-*/; do
+        [[ -d "$dir" ]] || continue
+        _print_worktree_row "${dir%/}" ""
+    done
+}
+
+_print_worktree_row() {
+    local dir="$1" label="$2"
+    local name
+    name=$(basename "$dir")
+    [[ -n "$label" ]] && name="${name} ${label}"
+
+    local version="(not built)"
+    local status="-"
+    local pg_ctl="${dir}/install/bin/pg_ctl"
+    local postgres="${dir}/install/bin/postgres"
+
+    if [[ -x "$postgres" ]]; then
+        version=$("$postgres" --version 2>/dev/null | sed 's/.* //' || echo "unknown")
+    fi
+
+    if [[ -d "${dir}/data" ]] && [[ -x "$pg_ctl" ]]; then
+        if "$pg_ctl" -D "${dir}/data" status &>/dev/null 2>&1; then
+            status="running"
+        else
+            status="stopped"
+        fi
+    fi
+
+    printf "%-30s  %-20s  %s\n" "$name" "$version" "$status"
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        new)        cmd_new "$@" ;;
+        build)      cmd_build "$@" ;;
+        configure)  cmd_configure "$@" ;;
+        initdb)     cmd_initdb "$@" ;;
+        deletedb)   cmd_deletedb "$@" ;;
+        start)      cmd_start "$@" ;;
+        stop)       cmd_stop "$@" ;;
+        restart)    cmd_restart "$@" ;;
+        status)     cmd_status "$@" ;;
+        test)       cmd_test "$@" ;;
+        rm)         cmd_rm "$@" ;;
+        ls)         cmd_ls "$@" ;;
+        setup)      cmd_setup "$@" ;;
+        help|--help|-h) cmd_help ;;
+        *)          die "unknown command '$cmd' — run 'pgdev help'" ;;
+    esac
+}
+
+main "$@"
