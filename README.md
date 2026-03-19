@@ -31,7 +31,7 @@ pgdev new REL_17_STABLE 17
 
 # Move into it, build, init, start
 cd ../pg-17
-pgdev build
+pgdev install
 pgdev initdb
 pgdev start
 
@@ -44,8 +44,9 @@ psql -c "SELECT version();"
 | Command | Description |
 |---------|-------------|
 | `pgdev new <branch> [name]` | Create a worktree for `<branch>` and write `.envrc`. Optional `name` overrides the directory name (`pg-<name>`) |
-| `pgdev build` | Configure + build + install the current worktree |
-| `pgdev configure` | Run `./configure` with dev flags (no build) |
+| `pgdev install` | Configure + build + install the current worktree (full pipeline) |
+| `pgdev configure` | Run `./configure` with dev flags |
+| `pgdev build` | Compile only (`make -jN`) |
 | `pgdev initdb [--port PORT]` | Initialize `data/` for the current worktree. Optional `--port` sets a custom port in both `postgresql.conf` and `.envrc` |
 | `pgdev deletedb` | Stop the cluster (if running) and remove `data/` |
 | `pgdev start` | Start the cluster |
@@ -90,7 +91,7 @@ Every build uses developer-friendly defaults:
 | `CFLAGS="-ggdb -Og -g3 -fno-omit-frame-pointer"` | Full debug info, minimal optimization |
 | `CC="ccache cc"` | ccache for fast rebuilds (falls back to `cc` if ccache is not installed) |
 
-If [bear](https://github.com/rizsotto/Bear) is installed, `pgdev build` automatically wraps the build to generate `compile_commands.json` for IDE integration (clangd, VS Code, Cursor).
+If [bear](https://github.com/rizsotto/Bear) is installed, `pgdev build` and `pgdev install` automatically wrap the build to generate `compile_commands.json` for IDE integration (clangd, VS Code, Cursor).
 
 ### Per-Worktree Overrides
 

@@ -173,9 +173,10 @@ cmd_help() {
 pgdev - PostgreSQL multi-version development environment helper
 
 Commands:
-  pgdev new <branch> [name]   Create worktree for <branch>, configure, build
-  pgdev build                 Configure + build + install current worktree
-  pgdev configure             Run ./configure with dev flags (no build)
+  pgdev new <branch> [name]   Create worktree for <branch>
+  pgdev install               Configure + build + install current worktree
+  pgdev configure             Run ./configure with dev flags
+  pgdev build                 Compile only (make -jN)
   pgdev initdb [--port PORT]   Initialize PGDATA (data/) for current worktree
   pgdev deletedb              Stop cluster (if running) and delete data/
   pgdev start                 Start postgres cluster
@@ -253,7 +254,7 @@ cmd_setup() {
     fi
 
     if [[ $ok -eq 1 ]]; then
-        info "All good! Run 'pgdev build' to build the current worktree."
+        info "All good! Run 'pgdev install' to build the current worktree."
     else
         info "Fix the issues above, then run 'pgdev setup' again."
     fi
@@ -276,7 +277,10 @@ cmd_new() {
     [[ -d "$dest" ]] && die "directory already exists: $dest"
 
     info "Creating worktree for '$branch' at $dest"
-    git worktree add "$dest" "$branch"
+    if ! git worktree add "$dest" "$branch" 2>/dev/null; then
+        info "Branch '$branch' already checked out — creating detached worktree at '$branch' HEAD"
+        git worktree add --detach "$dest" "$branch"
+    fi
 
     info "Writing .envrc"
     printf '%s' "$ENVRC_TEMPLATE" > "$dest/.envrc"
@@ -285,7 +289,7 @@ cmd_new() {
     info "Done! To get started:"
     echo ""
     echo "  cd $dest"
-    echo "  pgdev build"
+    echo "  pgdev install"
     echo "  pgdev initdb"
     echo "  pgdev start"
 }
@@ -294,8 +298,7 @@ cmd_build() {
     local root
     root=$(worktree_root)
     cd "$root"
-    _do_configure
-    _do_make
+    _do_build
 }
 
 cmd_configure() {
@@ -303,6 +306,15 @@ cmd_configure() {
     root=$(worktree_root)
     cd "$root"
     _do_configure
+}
+
+cmd_install() {
+    local root
+    root=$(worktree_root)
+    cd "$root"
+    _do_configure
+    _do_build
+    _do_install
 }
 
 _load_pgdev_conf() {
@@ -333,7 +345,7 @@ _do_configure() {
         "CPPFLAGS=${PG_CPPFLAGS}"
 }
 
-_do_make() {
+_do_build() {
     _require make
     local j
     j=$(cpu_count)
@@ -344,6 +356,10 @@ _do_make() {
     else
         make -j"$j"
     fi
+}
+
+_do_install() {
+    _require make
     info "Installing to ./install/"
     make install
     info "Installing contrib..."
@@ -392,7 +408,7 @@ cmd_initdb() {
     local datadir="${root}/data"
     local bindir="${root}/install/bin"
 
-    [[ -d "$bindir" ]] || die "install/bin not found — run 'pgdev build' first"
+    [[ -d "$bindir" ]] || die "install/bin not found — run 'pgdev install' first"
     [[ -d "$datadir" ]] && die "data/ already exists at $datadir"
 
     info "Initializing cluster at $datadir"
@@ -463,7 +479,7 @@ cmd_status() {
     if [[ -x "$postgres" ]]; then
         echo "Version: $("$postgres" --version)"
     else
-        echo "Version: (not built — run pgdev build)"
+        echo "Version: (not built — run pgdev install)"
     fi
 
     if [[ -d "$data" ]] && [[ -x "$pg_ctl" ]]; then
@@ -574,6 +590,7 @@ main() {
 
     case "$cmd" in
         new)        cmd_new "$@" ;;
+        install)    cmd_install "$@" ;;
         build)      cmd_build "$@" ;;
         configure)  cmd_configure "$@" ;;
         initdb)     cmd_initdb "$@" ;;
