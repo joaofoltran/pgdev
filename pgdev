@@ -11,6 +11,7 @@ PG_CONFIGURE_DEFAULTS=(
     --enable-cassert
     --enable-debug
     --enable-depend
+    --enable-tap-tests
     --with-openssl
     --with-readline
     --with-icu
@@ -185,6 +186,9 @@ Commands:
   pgdev status                Show pg_ctl status and postgres version
   pgdev test [world|check|installcheck] [extra make args...]
                               Run regression tests
+  pgdev test tap [suite] [--test FILE] [extra make args...]
+                              Run TAP tests (e.g. pgdev test tap recovery)
+  pgdev test tap --list       List available TAP test suites
   pgdev rm <name>             Stop cluster and remove worktree (e.g. pgdev rm 17)
   pgdev ls                    List all pg-* worktrees with version + status
   pgdev setup                 Check dependencies and print setup status
@@ -203,7 +207,7 @@ EOF
 cmd_setup() {
     info "Checking dependencies..."
     local ok=1
-    for cmd in ccache direnv git make; do
+    for cmd in ccache direnv git make prove; do
         if command -v "$cmd" &>/dev/null; then
             echo "  ✓ $cmd ($(command -v "$cmd"))"
         else
@@ -250,6 +254,19 @@ cmd_setup() {
         echo "  ✓ direnv hook in shell rc"
     else
         echo "  ✗ direnv hook missing from shell rc — add: eval \"\$(direnv hook bash)\" (or zsh)"
+        ok=0
+    fi
+
+    # Check Perl IPC::Run (required for TAP tests)
+    if perl -MIPC::Run -e 1 &>/dev/null 2>&1; then
+        echo "  ✓ Perl IPC::Run"
+    else
+        echo "  ✗ Perl IPC::Run — required for TAP tests"
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            echo "    Fix: cpan IPC::Run  (or: brew install perl && cpan IPC::Run)"
+        else
+            echo "    Fix: cpan IPC::Run  (or install libperl-ipc-run / perl-IPC-Run from your package manager)"
+        fi
         ok=0
     fi
 
@@ -489,8 +506,135 @@ cmd_status() {
     fi
 }
 
+# Well-known TAP test suite shortcuts (name → path relative to source root)
+declare -A TAP_SUITES=(
+    [recovery]="src/test/recovery"
+    [ssl]="src/test/ssl"
+    [subscription]="src/test/subscription"
+    [authentication]="src/test/authentication"
+    [ldap]="src/test/ldap"
+    [kerberos]="src/test/kerberos"
+    [pg_dump]="src/bin/pg_dump"
+    [pg_basebackup]="src/bin/pg_basebackup"
+    [pg_rewind]="src/bin/pg_rewind"
+    [pg_ctl]="src/bin/pg_ctl"
+    [pg_config]="src/bin/pg_config"
+    [pg_verify_checksums]="src/bin/pg_checksums"
+    [initdb]="src/bin/initdb"
+    [psql]="src/bin/psql"
+    [pg_upgrade]="src/bin/pg_upgrade"
+    [pg_resetwal]="src/bin/pg_resetwal"
+    [pg_amcheck]="src/bin/pg_amcheck"
+    [pg_waldump]="src/bin/pg_waldump"
+)
+
+_tap_find_suites() {
+    local root="$1"
+    local dirs=()
+    while IFS= read -r -d '' tdir; do
+        local parent
+        parent=$(dirname "$tdir")
+        dirs+=("${parent#"${root}/"}")
+    done < <(find "$root/src" -type d -name t -print0 2>/dev/null | sort -z)
+    printf '%s\n' "${dirs[@]}"
+}
+
+cmd_test_tap() {
+    _require make
+    _require prove
+    local root
+    root=$(worktree_root)
+    cd "$root"
+
+    local suite=""
+    local test_file=""
+    local make_args=()
+    local list_mode=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --list)
+                list_mode=1
+                shift
+                ;;
+            --test)
+                [[ -n "${2:-}" ]] || die "--test requires a filename"
+                test_file="$2"
+                shift 2
+                ;;
+            --test=*)
+                test_file="${1#--test=}"
+                shift
+                ;;
+            *)
+                if [[ -z "$suite" ]]; then
+                    suite="$1"
+                else
+                    make_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ $list_mode -eq 1 ]]; then
+        info "Available TAP test suites:"
+        echo ""
+        printf "  %-25s  %s\n" "SHORTCUT" "PATH"
+        printf "  %-25s  %s\n" "--------" "----"
+        for key in $(printf '%s\n' "${!TAP_SUITES[@]}" | sort); do
+            printf "  %-25s  %s\n" "$key" "${TAP_SUITES[$key]}"
+        done
+        echo ""
+        info "Other directories with t/ tests:"
+        while IFS= read -r dir; do
+            local is_shortcut=0
+            for v in "${TAP_SUITES[@]}"; do
+                [[ "$v" == "$dir" ]] && { is_shortcut=1; break; }
+            done
+            [[ $is_shortcut -eq 0 ]] && echo "  $dir"
+        done < <(_tap_find_suites "$root")
+        return
+    fi
+
+    [[ -n "$suite" ]] || die "usage: pgdev test tap <suite> [--test FILE] [extra make args...]\n  Run 'pgdev test tap --list' to see available suites"
+
+    # Resolve shortcut or treat as path
+    local suite_path="${TAP_SUITES[$suite]:-$suite}"
+
+    [[ -d "$suite_path" ]] || die "TAP suite directory not found: $suite_path"
+    [[ -d "$suite_path/t" ]] || die "no t/ directory in $suite_path — not a TAP test suite"
+
+    local j
+    j=$(cpu_count)
+
+    local prove_tests=""
+    if [[ -n "$test_file" ]]; then
+        if [[ "$test_file" != t/* ]]; then
+            test_file="t/${test_file}"
+        fi
+        [[ -f "${suite_path}/${test_file}" ]] || die "test file not found: ${suite_path}/${test_file}"
+        prove_tests="PROVE_TESTS=${test_file}"
+    fi
+
+    info "Running TAP tests in ${suite_path}"
+    if [[ -n "$prove_tests" ]]; then
+        info "  Test file: ${test_file}"
+        make -j"$j" -C "$suite_path" check "$prove_tests" "${make_args[@]+"${make_args[@]}"}"
+    else
+        make -j"$j" -C "$suite_path" check "${make_args[@]+"${make_args[@]}"}"
+    fi
+}
+
 cmd_test() {
     _require make
+
+    if [[ "${1:-}" == "tap" ]]; then
+        shift
+        cmd_test_tap "$@"
+        return
+    fi
+
     local root
     root=$(worktree_root)
     cd "$root"
