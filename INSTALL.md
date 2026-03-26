@@ -7,39 +7,38 @@
 | Tool | Purpose | Install |
 |------|---------|---------|
 | **git** | Worktree management, PostgreSQL source | Pre-installed on macOS; `apt install git` / `dnf install git` |
-| **make** | Build PostgreSQL | Xcode CLT on macOS (`xcode-select --install`); `apt install build-essential` / `dnf groupinstall "Development Tools"` |
+| **meson** | Configure PostgreSQL builds (replaces `./configure`) | `brew install meson` / `pip install meson` / `apt install meson` |
+| **ninja** | Fast parallel builds (replaces `make`) | `brew install ninja` / `pip install ninja` / `apt install ninja-build` |
 | **direnv** | Auto-loads per-worktree environment variables | `brew install direnv` / `apt install direnv` / `dnf install direnv` |
 
 ### Optional
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| **ccache** | Caches compilation artifacts for fast rebuilds (pgdev falls back to plain `cc` without it) | `brew install ccache` / `apt install ccache` / `dnf install ccache` |
-| **bear** | Generates `compile_commands.json` for IDE support (clangd, VS Code, Cursor) | `brew install bear` / `apt install bear` |
+| **ccache** | Caches compilation artifacts for fast rebuilds (meson uses it automatically if installed) | `brew install ccache` / `apt install ccache` / `dnf install ccache` |
 
 ### Build Dependencies (macOS — Homebrew)
 
 ```bash
-brew install openssl readline icu4c direnv ccache
+brew install meson ninja openssl readline icu4c direnv ccache
 ```
 
 ### Build Dependencies (Linux — Debian/Ubuntu)
 
 ```bash
-sudo apt install build-essential libssl-dev libreadline-dev libicu-dev direnv ccache
+sudo apt install meson ninja-build libssl-dev libreadline-dev libicu-dev direnv ccache
 ```
 
 ### Build Dependencies (Linux — Fedora/RHEL)
 
 ```bash
-sudo dnf groupinstall "Development Tools"
-sudo dnf install openssl-devel readline-devel libicu-devel direnv ccache
+sudo dnf install meson ninja-build openssl-devel readline-devel libicu-devel direnv ccache
 ```
 
 ### Build Dependencies (Linux — Arch)
 
 ```bash
-sudo pacman -S base-devel openssl readline icu direnv ccache
+sudo pacman -S meson ninja openssl readline icu direnv ccache
 ```
 
 ## Install pgdev
@@ -132,13 +131,14 @@ You should see checkmarks for all dependencies:
   ✓ ccache (/opt/homebrew/bin/ccache)
   ✓ direnv (/opt/homebrew/bin/direnv)
   ✓ git (/usr/bin/git)
-  ✓ make (/usr/bin/make)
+  ✓ meson (/opt/homebrew/bin/meson)
+  ✓ ninja (/opt/homebrew/bin/ninja)
   ✓ openssl
   ✓ readline
   ✓ icu4c
   ✓ ccache hash_dir=false
   ✓ direnv hook in shell rc
-==> All good! Run 'pgdev build' to build the current worktree.
+==> All good! Run 'pgdev install' to build the current worktree.
 ```
 
 ## First Build
@@ -153,7 +153,7 @@ pgdev new REL_17_STABLE 17
 cd ../pg-17
 
 # Build, initialize, start
-pgdev build
+pgdev install
 pgdev initdb
 pgdev start
 
