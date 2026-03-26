@@ -7,24 +7,18 @@ set -euo pipefail
 
 PGDEV_REPOS_DIR="${PGDEV_REPOS_DIR:-}"
 
-PG_CONFIGURE_DEFAULTS=(
-    --enable-cassert
-    --enable-debug
-    --enable-depend
-    --enable-tap-tests
-    --with-openssl
-    --with-readline
-    --with-icu
+PG_MESON_DEFAULTS=(
+    -Dcassert=true
+    -Dssl=openssl
+    -Dreadline=enabled
+    -Dicu=enabled
+    -Dtap_tests=enabled
 )
 
-PG_CFLAGS="-ggdb -Og -g3 -fno-omit-frame-pointer"
-if command -v ccache &>/dev/null; then
-    PG_CC="ccache cc"
-else
-    PG_CC="cc"
-fi
+PG_EXTRA_CFLAGS=(-ggdb -g3 -fno-omit-frame-pointer)
 
 # Homebrew paths for Apple Silicon (fallback to Intel if needed)
+PG_MESON_PLATFORM_FLAGS=()
 case "$(uname -s)" in
     Darwin)
         if [[ -d /opt/homebrew ]]; then
@@ -32,12 +26,10 @@ case "$(uname -s)" in
         else
             HB="/usr/local"
         fi
-        PG_LDFLAGS="-L${HB}/opt/openssl/lib -L${HB}/opt/readline/lib -L${HB}/opt/icu4c/lib"
-        PG_CPPFLAGS="-I${HB}/opt/openssl/include -I${HB}/opt/readline/include -I${HB}/opt/icu4c/include"
-        ;;
-    Linux)
-        PG_LDFLAGS=""
-        PG_CPPFLAGS=""
+        PG_MESON_PLATFORM_FLAGS=(
+            "-Dextra_include_dirs=${HB}/opt/openssl/include,${HB}/opt/readline/include,${HB}/opt/icu4c/include"
+            "-Dextra_lib_dirs=${HB}/opt/openssl/lib,${HB}/opt/readline/lib,${HB}/opt/icu4c/lib"
+        )
         ;;
 esac
 
@@ -89,11 +81,6 @@ _check_linux_lib() {
 worktree_root() {
     _require git
     git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"
-}
-
-# Detect CPU count
-cpu_count() {
-    nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4
 }
 
 _detect_shell_rc() {
@@ -176,19 +163,17 @@ pgdev - PostgreSQL multi-version development environment helper
 Commands:
   pgdev new <branch> [name]   Create worktree for <branch>
   pgdev install               Configure + build + install current worktree
-  pgdev configure             Run ./configure with dev flags
-  pgdev build                 Compile only (make -jN)
+  pgdev configure             Run meson setup with dev flags
+  pgdev build                 Compile only (ninja)
   pgdev initdb [--port PORT]   Initialize PGDATA (data/) for current worktree
   pgdev deletedb              Stop cluster (if running) and delete data/
   pgdev start                 Start postgres cluster
   pgdev stop                  Stop postgres cluster
   pgdev restart               Restart postgres cluster
   pgdev status                Show pg_ctl status and postgres version
-  pgdev test [world|check|installcheck] [extra make args...]
-                              Run regression tests
-  pgdev test tap [suite] [--test FILE] [extra make args...]
-                              Run TAP tests (e.g. pgdev test tap recovery)
-  pgdev test tap --list       List available TAP test suites
+  pgdev test [check|world|installcheck] [extra args...]
+                              Run regression tests (meson test)
+  pgdev test --list           List all available test cases
   pgdev rm <name>             Stop cluster and remove worktree (e.g. pgdev rm 17)
   pgdev ls                    List all pg-* worktrees with version + status
   pgdev setup                 Check dependencies and print setup status
@@ -199,15 +184,15 @@ Environment:
                     (default: auto-detected from current git repo)
 
 Per-worktree override:
-  Create pgdev.conf in the repo root to override configure flags:
-    EXTRA_CONFIGURE_FLAGS=(--with-python --with-perl)
+  Create pgdev.conf in the repo root to add extra meson flags:
+    EXTRA_MESON_FLAGS=(-Dplpython=enabled -Dplperl=enabled)
 EOF
 }
 
 cmd_setup() {
     info "Checking dependencies..."
     local ok=1
-    for cmd in ccache direnv git make prove; do
+    for cmd in ccache direnv git meson ninja; do
         if command -v "$cmd" &>/dev/null; then
             echo "  ✓ $cmd ($(command -v "$cmd"))"
         else
@@ -335,9 +320,8 @@ cmd_install() {
 }
 
 _load_pgdev_conf() {
-    # Source optional pgdev.conf from worktree root for per-worktree overrides
     local conf="${1}/pgdev.conf"
-    EXTRA_CONFIGURE_FLAGS=()
+    EXTRA_MESON_FLAGS=()
     if [[ -f "$conf" ]]; then
         # shellcheck source=/dev/null
         source "$conf"
@@ -345,42 +329,53 @@ _load_pgdev_conf() {
 }
 
 _do_configure() {
-    # Must be called from the worktree root
-    [[ -x "./configure" ]] || die "./configure not found — are you inside a PostgreSQL source tree?"
+    [[ -f "meson.build" ]] || die "meson.build not found — are you inside a PostgreSQL source tree? (meson build requires PG 16+)"
+    _require meson
     _load_pgdev_conf "$PWD"
 
     local prefix="$PWD/install"
+    local builddir="$PWD/build"
     info "Configuring with prefix=$prefix"
 
-    ./configure \
-        --prefix="$prefix" \
-        "${PG_CONFIGURE_DEFAULTS[@]}" \
-        "${EXTRA_CONFIGURE_FLAGS[@]+"${EXTRA_CONFIGURE_FLAGS[@]}"}" \
-        "CFLAGS=${PG_CFLAGS}" \
-        "CC=${PG_CC}" \
-        "LDFLAGS=${PG_LDFLAGS}" \
-        "CPPFLAGS=${PG_CPPFLAGS}"
+    # Format PG_EXTRA_CFLAGS as a meson array: ['-flag1', '-flag2', ...]
+    local c_args_str
+    c_args_str=$(printf ", '%s'" "${PG_EXTRA_CFLAGS[@]}")
+    c_args_str="[${c_args_str:2}]"
+
+    local meson_args=(
+        --prefix="$prefix"
+        --debug
+        --optimization=g
+        "${PG_MESON_DEFAULTS[@]}"
+        "${PG_MESON_PLATFORM_FLAGS[@]+"${PG_MESON_PLATFORM_FLAGS[@]}"}"
+        "${EXTRA_MESON_FLAGS[@]+"${EXTRA_MESON_FLAGS[@]}"}"
+        "-Dc_args=${c_args_str}"
+    )
+
+    if [[ -d "$builddir" ]]; then
+        meson setup --reconfigure "$builddir" "${meson_args[@]}"
+    else
+        meson setup "$builddir" "${meson_args[@]}"
+    fi
+
+    # compile_commands.json is generated in build/ — symlink for IDE integration
+    ln -sf build/compile_commands.json compile_commands.json
 }
 
 _do_build() {
-    _require make
-    local j
-    j=$(cpu_count)
-    info "Building with make -j${j}"
-    if command -v bear &>/dev/null; then
-        info "Wrapping build with bear (compile_commands.json)"
-        bear -- make -j"$j"
-    else
-        make -j"$j"
-    fi
+    _require ninja
+    local builddir="$PWD/build"
+    [[ -d "$builddir" ]] || die "build/ not found — run 'pgdev configure' first"
+    info "Building with ninja"
+    ninja -C "$builddir"
 }
 
 _do_install() {
-    _require make
+    _require ninja
+    local builddir="$PWD/build"
+    [[ -d "$builddir" ]] || die "build/ not found — run 'pgdev configure' first"
     info "Installing to ./install/"
-    make install
-    info "Installing contrib..."
-    make -C contrib install
+    ninja -C "$builddir" install
 }
 
 cmd_deletedb() {
@@ -506,155 +501,38 @@ cmd_status() {
     fi
 }
 
-# Well-known TAP test suite shortcuts (name → path relative to source root)
-declare -A TAP_SUITES=(
-    [recovery]="src/test/recovery"
-    [ssl]="src/test/ssl"
-    [subscription]="src/test/subscription"
-    [authentication]="src/test/authentication"
-    [ldap]="src/test/ldap"
-    [kerberos]="src/test/kerberos"
-    [pg_dump]="src/bin/pg_dump"
-    [pg_basebackup]="src/bin/pg_basebackup"
-    [pg_rewind]="src/bin/pg_rewind"
-    [pg_ctl]="src/bin/pg_ctl"
-    [pg_config]="src/bin/pg_config"
-    [pg_verify_checksums]="src/bin/pg_checksums"
-    [initdb]="src/bin/initdb"
-    [psql]="src/bin/psql"
-    [pg_upgrade]="src/bin/pg_upgrade"
-    [pg_resetwal]="src/bin/pg_resetwal"
-    [pg_amcheck]="src/bin/pg_amcheck"
-    [pg_waldump]="src/bin/pg_waldump"
-)
-
-_tap_find_suites() {
-    local root="$1"
-    local dirs=()
-    while IFS= read -r -d '' tdir; do
-        local parent
-        parent=$(dirname "$tdir")
-        dirs+=("${parent#"${root}/"}")
-    done < <(find "$root/src" -type d -name t -print0 2>/dev/null | sort -z)
-    printf '%s\n' "${dirs[@]}"
-}
-
-cmd_test_tap() {
-    _require make
-    _require prove
-    local root
-    root=$(worktree_root)
-    cd "$root"
-
-    local suite=""
-    local test_file=""
-    local make_args=()
-    local list_mode=0
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --list)
-                list_mode=1
-                shift
-                ;;
-            --test)
-                [[ -n "${2:-}" ]] || die "--test requires a filename"
-                test_file="$2"
-                shift 2
-                ;;
-            --test=*)
-                test_file="${1#--test=}"
-                shift
-                ;;
-            *)
-                if [[ -z "$suite" ]]; then
-                    suite="$1"
-                else
-                    make_args+=("$1")
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [[ $list_mode -eq 1 ]]; then
-        info "Available TAP test suites:"
-        echo ""
-        printf "  %-25s  %s\n" "SHORTCUT" "PATH"
-        printf "  %-25s  %s\n" "--------" "----"
-        for key in $(printf '%s\n' "${!TAP_SUITES[@]}" | sort); do
-            printf "  %-25s  %s\n" "$key" "${TAP_SUITES[$key]}"
-        done
-        echo ""
-        info "Other directories with t/ tests:"
-        while IFS= read -r dir; do
-            local is_shortcut=0
-            for v in "${TAP_SUITES[@]}"; do
-                [[ "$v" == "$dir" ]] && { is_shortcut=1; break; }
-            done
-            [[ $is_shortcut -eq 0 ]] && echo "  $dir"
-        done < <(_tap_find_suites "$root")
-        return
-    fi
-
-    [[ -n "$suite" ]] || die "usage: pgdev test tap <suite> [--test FILE] [extra make args...]\n  Run 'pgdev test tap --list' to see available suites"
-
-    # Resolve shortcut or treat as path
-    local suite_path="${TAP_SUITES[$suite]:-$suite}"
-
-    [[ -d "$suite_path" ]] || die "TAP suite directory not found: $suite_path"
-    [[ -d "$suite_path/t" ]] || die "no t/ directory in $suite_path — not a TAP test suite"
-
-    local j
-    j=$(cpu_count)
-
-    local prove_tests=""
-    if [[ -n "$test_file" ]]; then
-        if [[ "$test_file" != t/* ]]; then
-            test_file="t/${test_file}"
-        fi
-        [[ -f "${suite_path}/${test_file}" ]] || die "test file not found: ${suite_path}/${test_file}"
-        prove_tests="PROVE_TESTS=${test_file}"
-    fi
-
-    info "Running TAP tests in ${suite_path}"
-    if [[ -n "$prove_tests" ]]; then
-        info "  Test file: ${test_file}"
-        make -j"$j" -C "$suite_path" check "$prove_tests" "${make_args[@]+"${make_args[@]}"}"
-    else
-        make -j"$j" -C "$suite_path" check "${make_args[@]+"${make_args[@]}"}"
-    fi
-}
-
 cmd_test() {
-    _require make
-
-    if [[ "${1:-}" == "tap" ]]; then
-        shift
-        cmd_test_tap "$@"
-        return
-    fi
-
+    _require meson
     local root
     root=$(worktree_root)
     cd "$root"
 
-    local target="check"
-    local make_args=()
+    local builddir="$PWD/build"
+    [[ -d "$builddir" ]] || die "build/ not found — run 'pgdev configure' first"
+
+    if [[ "${1:-}" == "--list" ]]; then
+        meson test -C "$builddir" --list
+        return
+    fi
+
+    local setup=""
+    local extra_args=()
 
     for arg in "$@"; do
         case "$arg" in
-            world)       target="check-world" ;;
-            installcheck) target="installcheck" ;;
-            check)       target="check" ;;
-            *)           make_args+=("$arg") ;;
+            check)        ;;
+            world)        ;;
+            installcheck) setup="running" ;;
+            *)            extra_args+=("$arg") ;;
         esac
     done
 
-    local j
-    j=$(cpu_count)
-    info "Running: make -j${j} $target ${make_args[*]+"${make_args[*]}"}"
-    make -j"$j" "$target" "${make_args[@]+"${make_args[@]}"}"
+    local cmd=(meson test -C "$builddir")
+    [[ -n "$setup" ]] && cmd+=(--setup "$setup")
+    cmd+=("${extra_args[@]+"${extra_args[@]}"}")
+
+    info "Running: ${cmd[*]}"
+    "${cmd[@]}"
 }
 
 cmd_rm() {

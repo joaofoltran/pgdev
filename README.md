@@ -45,15 +45,15 @@ psql -c "SELECT version();"
 |---------|-------------|
 | `pgdev new <branch> [name]` | Create a worktree for `<branch>` and write `.envrc`. Optional `name` overrides the directory name (`pg-<name>`) |
 | `pgdev install` | Configure + build + install the current worktree (full pipeline) |
-| `pgdev configure` | Run `./configure` with dev flags |
-| `pgdev build` | Compile only (`make -jN`) |
+| `pgdev configure` | Run `meson setup` with dev flags |
+| `pgdev build` | Compile only (`ninja`) |
 | `pgdev initdb [--port PORT]` | Initialize `data/` for the current worktree. Optional `--port` sets a custom port in both `postgresql.conf` and `.envrc` |
 | `pgdev deletedb` | Stop the cluster (if running) and remove `data/` |
 | `pgdev start` | Start the cluster |
 | `pgdev stop` | Stop the cluster |
 | `pgdev restart` | Restart the cluster |
 | `pgdev status` | Show postgres version and `pg_ctl` status |
-| `pgdev test [target] [args]` | Run regression tests. Targets: `check` (default), `world`, `installcheck` |
+| `pgdev test [target] [args]` | Run regression tests (`meson test`). Targets: `check` (default), `world`, `installcheck` |
 | `pgdev rm <name>` | Stop the cluster and remove the worktree cleanly (e.g. `pgdev rm 17`) |
 | `pgdev ls` | List all `pg-*` worktrees with version and running/stopped status |
 | `pgdev setup` | Check that all dependencies are installed |
@@ -68,7 +68,8 @@ psql -c "SELECT version();"
 ~/src/
 ├── postgres/              # main repo (git clone)
 ├── pg-17/                 # pgdev new REL_17_STABLE 17
-│   ├── install/           #   pgdev build → ./configure + make install
+│   ├── build/             #   pgdev configure → meson setup (out-of-tree)
+│   ├── install/           #   pgdev install → ninja install
 │   ├── data/              #   pgdev initdb
 │   ├── .envrc             #   direnv: PATH, PGDATA, PGPORT, PGHOST
 │   └── (postgres source)
@@ -78,28 +79,29 @@ psql -c "SELECT version();"
 
 ### Build Configuration
 
-Every build uses developer-friendly defaults:
+pgdev uses [meson](https://mesonbuild.com/) + [ninja](https://ninja-build.org/) for building (requires PostgreSQL 16+). Every build uses developer-friendly defaults:
 
-| Flag | Purpose |
+| Meson option | Purpose |
 |------|---------|
-| `--enable-cassert` | Enable assertion checks |
-| `--enable-debug` | Include debug symbols |
-| `--enable-depend` | Track header dependencies for incremental builds |
-| `--with-openssl` | SSL support |
-| `--with-readline` | readline support for `psql` |
-| `--with-icu` | ICU collation support |
-| `CFLAGS="-ggdb -Og -g3 -fno-omit-frame-pointer"` | Full debug info, minimal optimization |
-| `CC="ccache cc"` | ccache for fast rebuilds (falls back to `cc` if ccache is not installed) |
+| `-Dcassert=true` | Enable assertion checks |
+| `--debug --optimization=g` | Debug symbols with `-Og` optimization |
+| `-Dssl=openssl` | SSL support |
+| `-Dreadline=enabled` | readline support for `psql` |
+| `-Dicu=enabled` | ICU collation support |
+| `-Dtap_tests=enabled` | Enable TAP regression tests |
+| `-Dc_args=['-ggdb', '-g3', '-fno-omit-frame-pointer']` | Extra debug info, frame pointers for profiling |
 
-If [bear](https://github.com/rizsotto/Bear) is installed, `pgdev build` and `pgdev install` automatically wrap the build to generate `compile_commands.json` for IDE integration (clangd, VS Code, Cursor).
+Meson automatically uses [ccache](https://ccache.dev/) if it's installed — no extra configuration needed.
+
+`compile_commands.json` is generated automatically during configure and symlinked to the project root for IDE integration (clangd, VS Code, Cursor).
 
 ### Per-Worktree Overrides
 
-Create a `pgdev.conf` file in the worktree root to add extra configure flags:
+Create a `pgdev.conf` file in the worktree root to add extra meson flags:
 
 ```bash
 # pgdev.conf
-EXTRA_CONFIGURE_FLAGS=(--with-python --with-perl --with-llvm)
+EXTRA_MESON_FLAGS=(-Dplpython=enabled -Dplperl=enabled -Dllvm=enabled)
 ```
 
 ### direnv Integration
@@ -141,7 +143,7 @@ On first use, if `PGDEV_REPOS_DIR` is not set and you're not inside a git repo, 
 Every command validates its dependencies before running. If something is missing, you get a clear message pointing you to `pgdev setup`:
 
 ```
-pgdev: error: 'make' is not installed — run 'pgdev setup' to check all dependencies
+pgdev: error: 'ninja' is not installed — run 'pgdev setup' to check all dependencies
 ```
 
 `pgdev setup` checks everything at once and tells you exactly what to install and how.
