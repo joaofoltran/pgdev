@@ -47,6 +47,7 @@ psql -c "SELECT version();"
 | `pgdev install` | Configure + build + install the current worktree (full pipeline) |
 | `pgdev configure` | Run `meson setup` with dev flags |
 | `pgdev build` | Compile only (`ninja`) |
+| `pgdev clean` | Remove `build/` and `install/` directories (stops the cluster first if running) |
 | `pgdev initdb [--port PORT]` | Initialize `data/` for the current worktree. Optional `--port` sets a custom port in both `postgresql.conf` and `.envrc` |
 | `pgdev deletedb` | Stop the cluster (if running) and remove `data/` |
 | `pgdev start` | Start the cluster |

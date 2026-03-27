@@ -165,7 +165,8 @@ Commands:
   pgdev install               Configure + build + install current worktree
   pgdev configure             Run meson setup with dev flags
   pgdev build                 Compile only (ninja)
-  pgdev initdb [--port PORT]   Initialize PGDATA (data/) for current worktree
+  pgdev clean                 Remove build/ and install/ (like make clean)
+  pgdev initdb [--port PORT]  Initialize PGDATA (data/) for current worktree
   pgdev deletedb              Stop cluster (if running) and delete data/
   pgdev start                 Start postgres cluster
   pgdev stop                  Stop postgres cluster
@@ -270,18 +271,22 @@ cmd_new() {
     [[ -z "$name" ]] && name="$branch"
 
     # git worktree add requires being inside a git repo
-    worktree_root >/dev/null
+    local root
+    root=$(worktree_root)
 
     local parent
     parent=$(repos_parent)
-    local dest="${parent}/pg-${name}"
+
+    # Strip leading 'pg-' to avoid 'pg-pg-' doubling when branch already has the prefix
+    local wt_name="${name#pg-}"
+    local dest="${parent}/pg-${wt_name}"
 
     [[ -d "$dest" ]] && die "directory already exists: $dest"
 
     info "Creating worktree for '$branch' at $dest"
-    if ! git worktree add "$dest" "$branch" 2>/dev/null; then
+    if ! git -C "$root" worktree add "$dest" "$branch" 2>/dev/null; then
         info "Branch '$branch' already checked out — creating detached worktree at '$branch' HEAD"
-        git worktree add --detach "$dest" "$branch"
+        git -C "$root" worktree add --detach "$dest" "$branch"
     fi
 
     info "Writing .envrc"
@@ -376,6 +381,40 @@ _do_install() {
     [[ -d "$builddir" ]] || die "build/ not found — run 'pgdev configure' first"
     info "Installing to ./install/"
     ninja -C "$builddir" install
+}
+
+cmd_clean() {
+    local root
+    root=$(worktree_root)
+    local builddir="${root}/build"
+    local installdir="${root}/install"
+    local pg_ctl="${installdir}/bin/pg_ctl"
+    local datadir="${root}/data"
+
+    # Stop cluster if running — its binaries live in install/
+    if [[ -d "$datadir" ]] && [[ -x "$pg_ctl" ]]; then
+        if "$pg_ctl" -D "$datadir" status &>/dev/null 2>&1; then
+            info "Stopping running cluster..."
+            "$pg_ctl" -D "$datadir" stop
+        fi
+    fi
+
+    if [[ -d "$builddir" ]]; then
+        info "Removing build/"
+        rm -rf "$builddir"
+    fi
+
+    if [[ -d "$installdir" ]]; then
+        info "Removing install/"
+        rm -rf "$installdir"
+    fi
+
+    # Clean up compile_commands.json symlink
+    if [[ -L "${root}/compile_commands.json" ]]; then
+        rm -f "${root}/compile_commands.json"
+    fi
+
+    info "Done. Run 'pgdev configure' then 'pgdev build' to rebuild."
 }
 
 cmd_deletedb() {
@@ -615,6 +654,7 @@ main() {
         install)    cmd_install "$@" ;;
         build)      cmd_build "$@" ;;
         configure)  cmd_configure "$@" ;;
+        clean)      cmd_clean "$@" ;;
         initdb)     cmd_initdb "$@" ;;
         deletedb)   cmd_deletedb "$@" ;;
         start)      cmd_start "$@" ;;
